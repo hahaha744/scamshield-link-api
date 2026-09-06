@@ -104,6 +104,6 @@ def scan_link(request: LinkScanRequest):
         "processing_time_ms": elapsed_ms
     }
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "ScamShield Link API running"}
