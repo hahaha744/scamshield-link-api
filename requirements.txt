@@ -3,3 +3,7 @@ uvicorn
 scikit-learn
 joblib
 numpy
+tldextract
+requests
+urllib3
+pydantic
