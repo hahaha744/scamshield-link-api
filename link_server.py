@@ -1,3 +1,4 @@
+import contextlib
 import ipaddress
 import math
 import os
@@ -45,62 +46,63 @@ HIGH_RISK_TLDS = {
     "racing", "kim", "fit"
 }
 
+CLOUD_APP_PLATFORMS = {
+    "appspot.com", "firebaseapp.com", "web.app", "pages.dev",
+    "vercel.app", "netlify.app", "github.io", "glitch.me",
+    "workers.dev", "render.com"
+}
+
 TRUSTED_BRANDS = {
     "google", "paypal", "apple", "microsoft", "amazon",
     "facebook", "instagram", "netflix", "bankofamerica",
     "chase", "wellsfargo", "binance", "coinbase", "wikipedia",
-    "github", "twitter", "linkedin", "youtube"
+    "github", "twitter", "linkedin", "youtube", "python", "mozilla"
 }
 
 SUSPICIOUS_KEYWORDS = [
     "login", "verify", "update", "account", "banking",
     "secure", "signin", "credential", "passcode",
-    "authenticate", "wallet", "confirm"
+    "authenticate", "wallet", "confirm", "phishing",
+    "malware", "security", "verification", "authorize",
+    "reset-password", "billing", "invoice", "supportdesk"
 ]
 
 class PinnedHTTPSConnection(HTTPSConnection):
     """Per-connection object that connects directly to _pinned_ip while preserving SNI & Host header."""
+    def __init__(self, *args, **kwargs):
+        pinned_ip = kwargs.pop('_pinned_ip', None)
+        super().__init__(*args, **kwargs)
+        if pinned_ip:
+            self._pinned_ip = pinned_ip
+            self.server_hostname = self.host
+            self.host = pinned_ip
+
     def _new_conn(self):
         pinned_ip = getattr(self, '_pinned_ip', None)
         if not pinned_ip:
             raise RuntimeError("FAIL CLOSED: Connection object missing _pinned_ip attribute! Unpinned DNS lookup blocked.")
-        saved_host = self.host
-        self.host = pinned_ip
-        try:
-            conn = super()._new_conn()
-        finally:
-            self.host = saved_host
-        return conn
+        return super()._new_conn()
 
 class PinnedHTTPConnection(HTTPConnection):
     """Per-connection object that connects directly to _pinned_ip while preserving Host header."""
+    def __init__(self, *args, **kwargs):
+        pinned_ip = kwargs.pop('_pinned_ip', None)
+        super().__init__(*args, **kwargs)
+        if pinned_ip:
+            self._pinned_ip = pinned_ip
+            self.host = pinned_ip
+
     def _new_conn(self):
         pinned_ip = getattr(self, '_pinned_ip', None)
         if not pinned_ip:
             raise RuntimeError("FAIL CLOSED: Connection object missing _pinned_ip attribute! Unpinned DNS lookup blocked.")
-        saved_host = self.host
-        self.host = pinned_ip
-        try:
-            conn = super()._new_conn()
-        finally:
-            self.host = saved_host
-        return conn
+        return super()._new_conn()
 
 class PinnedHTTPSConnectionPool(HTTPSConnectionPool):
     ConnectionCls = PinnedHTTPSConnection
 
-    def _new_conn(self):
-        conn = super()._new_conn()
-        conn._pinned_ip = getattr(self, '_pinned_ip', None)
-        return conn
-
 class PinnedHTTPConnectionPool(HTTPConnectionPool):
     ConnectionCls = PinnedHTTPConnection
-
-    def _new_conn(self):
-        conn = super()._new_conn()
-        conn._pinned_ip = getattr(self, '_pinned_ip', None)
-        return conn
 
 class PinnedAdapter(HTTPAdapter):
     """Per-request HTTPAdapter configuring pools & connections with validated IP pinning without global socket mutation."""
@@ -108,18 +110,29 @@ class PinnedAdapter(HTTPAdapter):
         self._pinned_ip = pinned_ip
         super().__init__(*args, **kwargs)
 
+    def _patch_pool(self, pool):
+        if pool:
+            if isinstance(pool, HTTPSConnectionPool) or getattr(pool, 'scheme', '') == 'https':
+                pool.__class__ = PinnedHTTPSConnectionPool
+                pool.ConnectionCls = PinnedHTTPSConnection
+            else:
+                pool.__class__ = PinnedHTTPConnectionPool
+                pool.ConnectionCls = PinnedHTTPConnection
+            pool.conn_kw['_pinned_ip'] = self._pinned_ip
+            pool._pinned_ip = self._pinned_ip
+        return pool
+
     def get_connection(self, url, proxies=None):
         if proxies:
             raise requests.exceptions.ProxyError("Environment or explicit proxies are disabled for SSRF protection")
         pool = super().get_connection(url, proxies=None)
-        if url.startswith('https://'):
-            pool.__class__ = PinnedHTTPSConnectionPool
-            pool.ConnectionCls = PinnedHTTPSConnection
-        else:
-            pool.__class__ = PinnedHTTPConnectionPool
-            pool.ConnectionCls = PinnedHTTPConnection
-        pool._pinned_ip = self._pinned_ip
-        return pool
+        return self._patch_pool(pool)
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        if proxies:
+            raise requests.exceptions.ProxyError("Environment or explicit proxies are disabled for SSRF protection")
+        pool = super().get_connection_with_tls_context(request, verify, proxies=None, cert=cert)
+        return self._patch_pool(pool)
 
 def is_ip_address(host_str: str) -> bool:
     if not host_str:
@@ -228,6 +241,64 @@ def resolve_redirects_safely(initial_url: str, max_redirects=3, timeout=3.0):
 
     return current_url, redirect_count, False
 
+def check_google_safe_browsing(url: str) -> str:
+    """
+    Queries Google Safe Browsing API v4 if GSB_API_KEY environment variable is set.
+    Never hardcodes or logs the key.
+    Returns one of:
+      - "confirmed_threat" : API responded with a valid threat match list
+      - "no_match"         : API responded with a valid zero-match response
+      - "unavailable"      : API request timed out, rate limited, returned non-200, or returned malformed JSON
+      - "not_configured"   : GSB_API_KEY env var is missing or empty
+    """
+    api_key = os.environ.get("GSB_API_KEY", "").strip()
+    if not api_key:
+        return "not_configured"
+
+    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
+    payload = {
+        "client": {
+            "clientId": "fraudfender-scanner",
+            "clientVersion": "1.0.0"
+        },
+        "threatInfo": {
+            "threatTypes": [
+                "MALWARE",
+                "SOCIAL_ENGINEERING",
+                "UNWANTED_SOFTWARE",
+                "POTENTIALLY_HARMFUL_APPLICATION"
+            ],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": url}]
+        }
+    }
+
+    try:
+        res = requests.post(endpoint, json=payload, timeout=3.0)
+        if res.status_code == 200:
+            try:
+                data = res.json()
+            except Exception:
+                return "unavailable"
+
+            if not isinstance(data, dict):
+                return "unavailable"
+
+            if "matches" in data:
+                matches = data["matches"]
+                if isinstance(matches, list):
+                    return "confirmed_threat" if len(matches) > 0 else "no_match"
+                return "unavailable"
+            elif data == {}:
+                return "no_match"
+            else:
+                return "unavailable"
+        else:
+            return "unavailable"
+    except Exception:
+        return "unavailable"
+
 def evaluate_url(url_string: str):
     raw_input = url_string.strip()
     if not raw_input:
@@ -250,11 +321,22 @@ def evaluate_url(url_string: str):
     suffix = extracted.suffix.lower() if extracted.suffix else ""
     subdomain = extracted.subdomain.lower() if extracted.subdomain else ""
 
+    # 1. Google Safe Browsing Threat Intelligence Lookup
+    gsb_status = check_google_safe_browsing(formatted_url)
+    if gsb_status == "confirmed_threat":
+        return "phishing", 100, {
+            "score": 100,
+            "verdict": "phishing",
+            "signals": ["Confirmed threat match via Google Safe Browsing API"],
+            "registered_domain": registered_domain,
+            "threat_intel_status": "confirmed_threat"
+        }
+
     score = 0
     signals = []
     has_multiple_risk_signals = False
 
-    # 1. Scheme Validation
+    # 2. Scheme Validation
     if scheme != "https" and scheme != "http":
         score += 40
         signals.append(f"Unusual scheme '{scheme}'")
@@ -262,29 +344,29 @@ def evaluate_url(url_string: str):
         score += 15
         signals.append("Insecure HTTP connection (no SSL/TLS)")
 
-    # 2. IP Hostname Check
+    # 3. IP Hostname Check
     if is_ip_address(hostname):
         score += 50
         signals.append(f"Host is a raw IP address ({hostname})")
         has_multiple_risk_signals = True
 
-    # 3. Embedded Credentials Check
+    # 4. Embedded Credentials Check
     if parsed.username or parsed.password or "@" in raw_input:
         score += 30
         signals.append("URL contains embedded user credentials or '@' symbol")
         has_multiple_risk_signals = True
 
-    # 4. URL Shortener Check
+    # 5. URL Shortener Check
     if registered_domain in KNOWN_SHORTENERS or hostname in KNOWN_SHORTENERS:
         score += 30
         signals.append(f"Recognized URL shortener service ({registered_domain or hostname})")
 
-    # 5. High-Risk TLD Check
+    # 6. High-Risk TLD Check
     if suffix in HIGH_RISK_TLDS:
         score += 20
         signals.append(f"High-risk top-level domain (.{suffix})")
 
-    # 6. Brand Impersonation & Deceptive Subdomains
+    # 7. Brand Impersonation & Deceptive Subdomains
     matched_brand = None
     for brand in TRUSTED_BRANDS:
         if brand in subdomain or brand in decoded_path_query:
@@ -297,7 +379,16 @@ def evaluate_url(url_string: str):
         signals.append(f"Potential brand impersonation: '{matched_brand}' referenced outside official domain '{registered_domain}'")
         has_multiple_risk_signals = True
 
-    # 7. Structural Anomalies
+    # 8. Cloud App Hosting Platform Contextual Risk
+    is_cloud_platform = (suffix in CLOUD_APP_PLATFORMS) or (registered_domain in CLOUD_APP_PLATFORMS)
+    matched_keywords = [kw for kw in SUSPICIOUS_KEYWORDS if kw in decoded_path_query]
+
+    if is_cloud_platform and (matched_keywords or matched_brand):
+        score += 35
+        signals.append(f"Public cloud app platform ({registered_domain or suffix}) hosting suspicious authentication/security path")
+        has_multiple_risk_signals = True
+
+    # 9. Structural Anomalies
     hyphen_count = hostname.count("-")
     if hyphen_count > 2:
         score += 15
@@ -307,21 +398,19 @@ def evaluate_url(url_string: str):
         score += 15
         signals.append(f"Excessive URL length ({len(raw_input)} characters)")
 
-    # 8. Path & Query Keywords
+    # 10. Path & Query Keywords (only if registered domain is NOT an established/trusted brand)
     is_trusted_registered_domain = domain_name in TRUSTED_BRANDS
-    if not is_trusted_registered_domain:
-        matched_keywords = [kw for kw in SUSPICIOUS_KEYWORDS if kw in decoded_path_query]
-        if matched_keywords:
-            score += 15
-            signals.append(f"Suspicious path/query keywords found: {', '.join(matched_keywords)}")
+    if not is_trusted_registered_domain and matched_keywords and not is_cloud_platform:
+        score += 15
+        signals.append(f"Suspicious path/query keywords found: {', '.join(matched_keywords)}")
 
-    # 9. Encoded / Obfuscated Character Detection
+    # 11. Encoded / Obfuscated Character Detection
     if "%" in parsed.path or "%" in (parsed.query or ""):
         if re.search(r"%(25|20|40|2f|3c|3e|23)", path_and_query, re.IGNORECASE):
             score += 15
             signals.append("URL contains suspicious percent-encoded obfuscation")
 
-    # 10. Safe Redirect Follower & Anti-SSRF Check
+    # 12. Safe Redirect Follower & Anti-SSRF Check
     final_url, redirect_count, ssrf_flag = resolve_redirects_safely(formatted_url)
     if ssrf_flag:
         score += 40
@@ -349,7 +438,8 @@ def evaluate_url(url_string: str):
         "score": final_score,
         "verdict": verdict,
         "signals": signals if signals else ["No major risk heuristics triggered."],
-        "registered_domain": registered_domain
+        "registered_domain": registered_domain,
+        "threat_intel_status": gsb_status
     }
 
     return verdict, final_score, details
@@ -362,6 +452,7 @@ class LinkScanResponse(BaseModel):
     verdict: str
     signals: list = Field(default_factory=list)
     processing_time_ms: float = 0.0
+    threat_intel_status: str = "not_configured"
 
 @app.post("/scan_link", response_model=LinkScanResponse)
 def scan_link(request_data: LinkScanRequest):
@@ -382,7 +473,8 @@ def scan_link(request_data: LinkScanRequest):
             score=int(score),
             verdict=verdict,
             signals=formatted_signals,
-            processing_time_ms=elapsed_ms
+            processing_time_ms=elapsed_ms,
+            threat_intel_status=details.get("threat_intel_status", "not_configured")
         )
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
