@@ -416,29 +416,25 @@ def check_google_safe_browsing(url: str) -> str:
                 status = "unavailable"
                 return status
 
-            duration_sec = parse_cache_duration(data.get("cacheDuration"))
-
             if "threats" in data:
                 threats = data["threats"]
-                if isinstance(threats, list):
-                    if len(threats) > 0:
-                        candidate_status = "confirmed_threat"
-                    else:
-                        candidate_status = "no_match"
-
-                    if duration_sec is not None:
-                        cached_ok = convert_reservation_to_cache(url, candidate_status, duration_sec)
-                        if cached_ok:
-                            status = candidate_status
-                            cached_successfully = True
-                        else:
-                            status = "unavailable"
-                    else:
-                        status = "unavailable"
+                if isinstance(threats, list) and len(threats) > 0:
+                    candidate_status = "confirmed_threat"
+                elif isinstance(threats, list):
+                    candidate_status = "no_match"
                 else:
                     status = "unavailable"
+                    return status
             else:
-                status = "unavailable"
+                candidate_status = "no_match"
+
+            status = candidate_status
+
+            duration_sec = parse_cache_duration(data.get("cacheDuration"))
+            if duration_sec is not None:
+                cached_ok = convert_reservation_to_cache(url, candidate_status, duration_sec)
+                if cached_ok:
+                    cached_successfully = True
         else:
             status = "unavailable"
     except Exception:
