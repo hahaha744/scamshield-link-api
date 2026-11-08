@@ -441,24 +441,48 @@ def check_google_safe_browsing(url: str) -> str:
             status = "unavailable"
             content_type = res.headers.get("Content-Type", "unknown")
             err_status = ""
+            err_msg = ""
             err_reason = ""
+            err_service = ""
             try:
                 err_json = res.json()
                 if isinstance(err_json, dict) and "error" in err_json:
                     err_dict = err_json["error"]
                     err_status = str(err_dict.get("status", ""))[:50]
+                    raw_msg = str(err_dict.get("message", ""))
+                    if api_key:
+                        raw_msg = raw_msg.replace(api_key, "[REDACTED_KEY]")
+                        enc_key = urllib.parse.quote(api_key)
+                        if enc_key and enc_key != api_key:
+                            raw_msg = raw_msg.replace(enc_key, "[REDACTED_KEY]")
+                        enc_key_plus = urllib.parse.quote_plus(api_key)
+                        if enc_key_plus and enc_key_plus != api_key and enc_key_plus != enc_key:
+                            raw_msg = raw_msg.replace(enc_key_plus, "[REDACTED_KEY]")
+                    if url:
+                        raw_msg = raw_msg.replace(url, "[REDACTED_URL]")
+                        enc_url = urllib.parse.quote(url)
+                        if enc_url and enc_url != url:
+                            raw_msg = raw_msg.replace(enc_url, "[REDACTED_URL]")
+                        enc_url_plus = urllib.parse.quote_plus(url)
+                        if enc_url_plus and enc_url_plus != url and enc_url_plus != enc_url:
+                            raw_msg = raw_msg.replace(enc_url_plus, "[REDACTED_URL]")
+                    err_msg = raw_msg[:200]
+
                     details = err_dict.get("details", [])
                     if isinstance(details, list):
                         for item in details:
-                            if isinstance(item, dict) and "reason" in item:
-                                err_reason = str(item["reason"])[:50]
-                                break
+                            if isinstance(item, dict):
+                                if not err_reason and "reason" in item:
+                                    err_reason = str(item["reason"])[:50]
+                                metadata = item.get("metadata")
+                                if not err_service and isinstance(metadata, dict) and "service" in metadata:
+                                    err_service = str(metadata["service"])[:50]
             except Exception:
                 pass
 
             print(
                 f"[GSB Diagnostic] HTTP {res.status_code} Content-Type: {content_type} "
-                f"Status: {err_status} Reason: {err_reason}",
+                f"Status: {err_status} Reason: {err_reason} Service: {err_service} Msg: {err_msg}",
                 flush=True
             )
     except Exception as exc:
