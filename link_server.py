@@ -408,11 +408,13 @@ def check_google_safe_browsing(url: str) -> str:
         if res.status_code == 200:
             try:
                 data = res.json()
-            except Exception:
+            except Exception as e:
+                print(f"[GSB Diagnostic] JSON decode error: {e.__class__.__name__}", flush=True)
                 status = "unavailable"
                 return status
 
             if not isinstance(data, dict):
+                print(f"[GSB Diagnostic] Unexpected JSON data type: {type(data).__name__}", flush=True)
                 status = "unavailable"
                 return status
 
@@ -437,7 +439,30 @@ def check_google_safe_browsing(url: str) -> str:
                     cached_successfully = True
         else:
             status = "unavailable"
-    except Exception:
+            content_type = res.headers.get("Content-Type", "unknown")
+            err_status = ""
+            err_reason = ""
+            try:
+                err_json = res.json()
+                if isinstance(err_json, dict) and "error" in err_json:
+                    err_dict = err_json["error"]
+                    err_status = str(err_dict.get("status", ""))[:50]
+                    details = err_dict.get("details", [])
+                    if isinstance(details, list):
+                        for item in details:
+                            if isinstance(item, dict) and "reason" in item:
+                                err_reason = str(item["reason"])[:50]
+                                break
+            except Exception:
+                pass
+
+            print(
+                f"[GSB Diagnostic] HTTP {res.status_code} Content-Type: {content_type} "
+                f"Status: {err_status} Reason: {err_reason}",
+                flush=True
+            )
+    except Exception as exc:
+        print(f"[GSB Diagnostic] Network/Request Exception: {exc.__class__.__name__}", flush=True)
         status = "unavailable"
     finally:
         if not cached_successfully:
