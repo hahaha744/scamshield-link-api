@@ -4,6 +4,7 @@ import math
 import os
 import re
 import socket
+import threading
 import time
 import urllib.parse
 from fastapi import FastAPI, HTTPException, Request
@@ -66,6 +67,121 @@ SUSPICIOUS_KEYWORDS = [
     "malware", "security", "verification", "authorize",
     "reset-password", "billing", "invoice", "supportdesk"
 ]
+
+# Thread-Safe In-Memory TTL Cache and Request Coalescer State
+MAX_CACHE_ENTRIES = 10000
+
+_gsb_cache = {}          # { url_string: (status_str, expire_monotonic_timestamp) }
+_gsb_reserved = set()    # { url_string }
+_gsb_cache_lock = threading.Lock()
+
+class InFlightRequest:
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = "unavailable"
+
+_in_flight_requests = {} # { url_string: InFlightRequest_instance }
+_in_flight_lock = threading.Lock()
+
+def parse_cache_duration(duration_str) -> float:
+    """
+    Parses Google API cacheDuration strings like '300s' or '300.5s'.
+    Requires string ending in exactly 's' with positive float/int value.
+    Rejects malformed strings ('300ss', '300seconds', 'invalid'), zero ('0s'), and negative durations.
+    Returns positive float seconds if valid, or None if invalid.
+    """
+    if not duration_str or not isinstance(duration_str, str):
+        return None
+    s = duration_str.strip()
+    if not s.endswith("s") or s.endswith("ss") or s.endswith("seconds"):
+        return None
+    val_str = s[:-1]
+    if not re.match(r"^\d+(\.\d+)?$", val_str):
+        return None
+    try:
+        val = float(val_str)
+        if val > 0.0 and not math.isnan(val) and not math.isinf(val):
+            return val
+        return None
+    except (ValueError, TypeError):
+        return None
+
+def reserve_cache_capacity(url: str) -> bool:
+    """
+    Atomically checks cache capacity and reserves a slot for url if total used (unexpired entries + active reservations) < MAX_CACHE_ENTRIES.
+    Purges expired entries first.
+    Returns True if reservation was granted or url is already in cache/reserved.
+    Returns False if cache is at capacity with unexpired entries.
+    """
+    now = time.monotonic()
+    with _gsb_cache_lock:
+        expired_keys = [k for k, v in _gsb_cache.items() if now >= v[1]]
+        for k in expired_keys:
+            del _gsb_cache[k]
+
+        if url in _gsb_cache or url in _gsb_reserved:
+            return True
+
+        total_used = len(_gsb_cache) + len(_gsb_reserved)
+        if total_used < MAX_CACHE_ENTRIES:
+            _gsb_reserved.add(url)
+            return True
+
+        return False
+
+def release_cache_reservation(url: str):
+    """Releases capacity reservation if network request fails or cannot be cached."""
+    with _gsb_cache_lock:
+        _gsb_reserved.discard(url)
+
+def convert_reservation_to_cache(url: str, status: str, duration_sec: float) -> bool:
+    """
+    Converts active reservation for url into an unexpired cache entry.
+    Releases reservation in all cases.
+    NEVER evicts unexpired entries.
+    Returns True if successfully inserted into cache.
+    """
+    now = time.monotonic()
+    with _gsb_cache_lock:
+        _gsb_reserved.discard(url)
+
+        if status not in ("confirmed_threat", "no_match") or not duration_sec or duration_sec <= 0.0:
+            return False
+
+        expired_keys = [k for k, v in _gsb_cache.items() if now >= v[1]]
+        for k in expired_keys:
+            del _gsb_cache[k]
+
+        if len(_gsb_cache) >= MAX_CACHE_ENTRIES and url not in _gsb_cache:
+            return False
+
+        expire_time = now + duration_sec
+        _gsb_cache[url] = (status, expire_time)
+        return True
+
+def get_cached_gsb_status(url: str):
+    """
+    Returns cached status string if present and unexpired.
+    Does NOT extend expiration time on cache hit.
+    Purges expired entry if found expired.
+    """
+    now = time.monotonic()
+    with _gsb_cache_lock:
+        if url in _gsb_cache:
+            status, expire_time = _gsb_cache[url]
+            if now < expire_time:
+                return status
+            else:
+                del _gsb_cache[url]
+    return None
+
+def clear_gsb_cache_for_testing():
+    """Helper function to clear cache, reservations, and in-flight locks during testing."""
+    with _gsb_cache_lock:
+        _gsb_cache.clear()
+        _gsb_reserved.clear()
+    with _in_flight_lock:
+        _in_flight_requests.clear()
 
 class PinnedHTTPSConnection(HTTPSConnection):
     """Per-connection object that connects directly to _pinned_ip while preserving SNI & Host header."""
@@ -243,61 +359,98 @@ def resolve_redirects_safely(initial_url: str, max_redirects=3, timeout=3.0):
 
 def check_google_safe_browsing(url: str) -> str:
     """
-    Queries Google Safe Browsing API v4 if GSB_API_KEY environment variable is set.
-    Never hardcodes or logs the key.
-    Returns one of:
-      - "confirmed_threat" : API responded with a valid threat match list
-      - "no_match"         : API responded with a valid zero-match response
-      - "unavailable"      : API request timed out, rate limited, returned non-200, or returned malformed JSON
-      - "not_configured"   : GSB_API_KEY env var is missing or empty
+    Queries Google Safe Browsing API v5 (urls:search GET) if GSB_API_KEY environment variable is set.
+    Includes thread-safe TTL caching compliant with Google cacheDuration, atomic capacity reservation,
+    and duplicate request coalescing.
+    Never hardcodes or logs the API key.
     """
     api_key = os.environ.get("GSB_API_KEY", "").strip()
     if not api_key:
         return "not_configured"
 
-    endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
-    payload = {
-        "client": {
-            "clientId": "fraudfender-scanner",
-            "clientVersion": "1.0.0"
-        },
-        "threatInfo": {
-            "threatTypes": [
-                "MALWARE",
-                "SOCIAL_ENGINEERING",
-                "UNWANTED_SOFTWARE",
-                "POTENTIALLY_HARMFUL_APPLICATION"
-            ],
-            "platformTypes": ["ANY_PLATFORM"],
-            "threatEntryTypes": ["URL"],
-            "threatEntries": [{"url": url}]
-        }
-    }
+    # 1. Check in-memory TTL cache
+    cached = get_cached_gsb_status(url)
+    if cached is not None:
+        return cached
 
+    # 2. Check and reserve capacity atomically BEFORE making network call
+    if not reserve_cache_capacity(url):
+        return "unavailable"
+
+    # 3. Request Coalescing with shared InFlightRequest object
+    in_flight_obj = None
+    is_primary = False
+
+    with _in_flight_lock:
+        if url in _in_flight_requests:
+            in_flight_obj = _in_flight_requests[url]
+        else:
+            is_primary = True
+            in_flight_obj = InFlightRequest()
+            _in_flight_requests[url] = in_flight_obj
+
+    if not is_primary:
+        in_flight_obj.event.wait(timeout=3.5)
+        return in_flight_obj.result
+
+    # Primary Request Network I/O
+    status = "unavailable"
+    cached_successfully = False
     try:
-        res = requests.post(endpoint, json=payload, timeout=3.0)
+        endpoint = "https://safebrowsing.googleapis.com/v5/urls:search"
+        params = [
+            ("key", api_key),
+            ("urls", url)
+        ]
+
+        res = requests.get(endpoint, params=params, timeout=3.0)
         if res.status_code == 200:
             try:
                 data = res.json()
             except Exception:
-                return "unavailable"
+                status = "unavailable"
+                return status
 
             if not isinstance(data, dict):
-                return "unavailable"
+                status = "unavailable"
+                return status
 
-            if "matches" in data:
-                matches = data["matches"]
-                if isinstance(matches, list):
-                    return "confirmed_threat" if len(matches) > 0 else "no_match"
-                return "unavailable"
-            elif data == {}:
-                return "no_match"
+            duration_sec = parse_cache_duration(data.get("cacheDuration"))
+
+            if "threats" in data:
+                threats = data["threats"]
+                if isinstance(threats, list):
+                    if len(threats) > 0:
+                        candidate_status = "confirmed_threat"
+                    else:
+                        candidate_status = "no_match"
+
+                    if duration_sec is not None:
+                        cached_ok = convert_reservation_to_cache(url, candidate_status, duration_sec)
+                        if cached_ok:
+                            status = candidate_status
+                            cached_successfully = True
+                        else:
+                            status = "unavailable"
+                    else:
+                        status = "unavailable"
+                else:
+                    status = "unavailable"
             else:
-                return "unavailable"
+                status = "unavailable"
         else:
-            return "unavailable"
+            status = "unavailable"
     except Exception:
-        return "unavailable"
+        status = "unavailable"
+    finally:
+        if not cached_successfully:
+            release_cache_reservation(url)
+        in_flight_obj.result = status
+        in_flight_obj.event.set()
+        with _in_flight_lock:
+            _in_flight_requests.pop(url, None)
+
+    return status
 
 def evaluate_url(url_string: str):
     raw_input = url_string.strip()
