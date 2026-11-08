@@ -359,7 +359,7 @@ def resolve_redirects_safely(initial_url: str, max_redirects=3, timeout=3.0):
 
 def check_google_safe_browsing(url: str) -> str:
     """
-    Queries Google Safe Browsing API v5 (urls:search GET) if GSB_API_KEY environment variable is set.
+    Queries Google Safe Browsing API v4 (threatMatches:find POST) if GSB_API_KEY environment variable is set.
     Includes thread-safe TTL caching compliant with Google cacheDuration, atomic capacity reservation,
     and duplicate request coalescing.
     Never hardcodes or logs the API key.
@@ -390,20 +390,35 @@ def check_google_safe_browsing(url: str) -> str:
             _in_flight_requests[url] = in_flight_obj
 
     if not is_primary:
-        in_flight_obj.event.wait(timeout=3.5)
+        completed = in_flight_obj.event.wait(timeout=3.5)
+        if not completed:
+            return "unavailable"
         return in_flight_obj.result
 
     # Primary Request Network I/O
     status = "unavailable"
     cached_successfully = False
     try:
-        endpoint = "https://safebrowsing.googleapis.com/v5/urls:search"
-        params = [
-            ("key", api_key),
-            ("urls", url)
-        ]
+        endpoint = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
+        payload = {
+            "client": {
+                "clientId": "fraudfender-scanner",
+                "clientVersion": "1.0.0"
+            },
+            "threatInfo": {
+                "threatTypes": [
+                    "MALWARE",
+                    "SOCIAL_ENGINEERING",
+                    "UNWANTED_SOFTWARE",
+                    "POTENTIALLY_HARMFUL_APPLICATION"
+                ],
+                "platformTypes": ["ANY_PLATFORM"],
+                "threatEntryTypes": ["URL"],
+                "threatEntries": [{"url": url}]
+            }
+        }
 
-        res = requests.get(endpoint, params=params, timeout=3.0)
+        res = requests.post(endpoint, json=payload, timeout=3.0)
         if res.status_code == 200:
             try:
                 data = res.json()
@@ -417,21 +432,36 @@ def check_google_safe_browsing(url: str) -> str:
                 status = "unavailable"
                 return status
 
-            if "threats" in data:
-                threats = data["threats"]
-                if isinstance(threats, list) and len(threats) > 0:
+            duration_sec = None
+            if "matches" in data:
+                matches = data["matches"]
+                if isinstance(matches, list) and len(matches) > 0:
                     candidate_status = "confirmed_threat"
-                elif isinstance(threats, list):
+                    valid_durations = []
+                    for m in matches:
+                        if isinstance(m, dict):
+                            if "cacheDuration" in m:
+                                dur = parse_cache_duration(m["cacheDuration"])
+                                if dur is not None and dur > 0.0:
+                                    valid_durations.append(dur)
+                        else:
+                            status = "unavailable"
+                            return status
+                    if valid_durations:
+                        duration_sec = min(valid_durations)
+                elif isinstance(matches, list):
                     candidate_status = "no_match"
                 else:
                     status = "unavailable"
                     return status
-            else:
+            elif data == {}:
                 candidate_status = "no_match"
+            else:
+                status = "unavailable"
+                return status
 
             status = candidate_status
 
-            duration_sec = parse_cache_duration(data.get("cacheDuration"))
             if duration_sec is not None:
                 cached_ok = convert_reservation_to_cache(url, candidate_status, duration_sec)
                 if cached_ok:
