@@ -400,8 +400,7 @@ def check_google_safe_browsing(url: str) -> str:
         endpoint = "https://safebrowsing.googleapis.com/v5/urls:search"
         params = [
             ("key", api_key),
-            ("urls", url),
-            ("alt", "json")
+            ("urls", url)
         ]
 
         res = requests.get(endpoint, params=params, timeout=3.0)
